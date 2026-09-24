@@ -54,8 +54,11 @@ func TestPageSeparatesPreparedAndActiveProfiles(t *testing.T) {
 }
 
 func TestPageProvidesRouterModes(t *testing.T) {
-	for _, mode := range []string{`data-mode="vless"`, `data-mode="ovpn"`, `data-mode="blocked"`, `data-mode="direct"`} {
+	for _, mode := range []string{`data-mode="vless"`, `data-mode="blocked"`, `data-mode="direct"`} {
 		if !strings.Contains(page, mode) { t.Fatalf("page is missing %q", mode) }
+	}
+	for _, forbidden := range []string{"ovpn", "OVPN", "OpenVPN"} {
+		if strings.Contains(page, forbidden) { t.Fatalf("page must not contain %q", forbidden) }
 	}
 }
 

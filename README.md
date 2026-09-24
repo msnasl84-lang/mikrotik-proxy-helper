@@ -1,10 +1,11 @@
 # MikroTik Proxy Helper
 
-## Version 0.3.0-dev.6
+## Version 0.3.0-dev.8
 
 This release separates profile preparation from activation and adds file-based
-RouterOS mode requests for `vless`, `ovpn`, `blocked`, and `direct`. RouterOS
-remains the only privileged controller; the Helper stores no router password.
+RouterOS mode requests for `vless`, `blocked`, and `direct`. RouterOS remains
+the only privileged controller; the Helper stores no router password. OpenVPN
+is outside this project's scope and remains under independent RouterOS control.
 
 - Close SSE streams when the application context is cancelled.
 - Allow an intentional RouterOS container stop to finish without reaching the HTTP shutdown deadline.
@@ -16,6 +17,8 @@ remains the only privileged controller; the Helper stores no router password.
 
 - Automatic failover is disabled.
 - Automatic failback is disabled.
+- Load balancing is not implemented; exactly one VLESS profile is active at a time.
+- The Helper and Mode Manager do not inspect or modify OpenVPN configuration.
 - Only the selected profile may be prepared.
 - A profile change writes `config.pending.json`; it never overwrites the live Xray config directly.
 - RouterOS remains responsible for stopping Xray, validating/applying the pending config, starting Xray, and rolling back.
