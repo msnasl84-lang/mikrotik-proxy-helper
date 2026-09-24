@@ -30,6 +30,8 @@
 - Loopback-only test SOCKS listeners allocated from a bounded port pool.
 - Per-test total, startup, and HTTP timeouts with deterministic process cleanup.
 - Sequential Test All with one isolated Xray probe at a time.
+- Per-profile end-to-end TTFB latency with automatic `Best` highlighting.
+- Persistent latest test results restored after a Helper restart.
 - Live progress events over authenticated SSE.
 - Cancellation of the active Test All run.
 - Atomic retention of the latest 20 completed test runs.
@@ -40,6 +42,22 @@ Other protocols are detected but intentionally marked unsupported until their co
 
 - `/data`: persistent helper state.
 - `/shared/xray-config`: shared Xray configuration directory.
+
+## RouterOS firewall requirements for isolated tests
+
+The isolated Xray process runs inside the Helper container, so RouterOS must
+allow the Helper address to resolve DNS and connect to the VLESS server. Keep
+these permissions narrow:
+
+- allow TCP from the Helper address only to a `VLESS-SERVER` address list;
+- do not restrict the destination port, because subscription providers may
+  change it;
+- allow TCP/UDP port 53 only to an explicit `VLESS-DNS` address list;
+- keep all of these accept rules before the final forward-chain drop rule.
+
+The Helper does not manage RouterOS firewall or address-list entries. If a
+subscription changes the server hostname, add the new hostname to
+`VLESS-SERVER` before testing or activating that profile.
 
 ## Runtime environment
 
