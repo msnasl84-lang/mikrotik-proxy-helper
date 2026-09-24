@@ -1,6 +1,6 @@
 # MikroTik Proxy Helper
 
-## Version 0.3.0-dev.8
+## Version 0.3.0-dev.9
 
 This release separates profile preparation from activation and adds file-based
 RouterOS mode requests for `vless`, `blocked`, and `direct`. RouterOS remains
@@ -10,6 +10,8 @@ is outside this project's scope and remains under independent RouterOS control.
 - Close SSE streams when the application context is cancelled.
 - Allow an intentional RouterOS container stop to finish without reaching the HTTP shutdown deadline.
 - Add a regression test for SSE shutdown behavior.
+- Wait for RouterOS to confirm a requested mode instead of doing a single early refresh.
+- Refresh visible router status in the background every five seconds.
 
 `manual-health` subscription and tunnel helper for RouterOS containers.
 
