@@ -4,6 +4,7 @@ ARG TARGETOS TARGETARCH TARGETVARIANT
 WORKDIR /src
 COPY go.mod ./
 COPY cmd ./cmd
+COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} \
     go build -trimpath -ldflags="-s -w" -o /out/helper ./cmd/helper
 
