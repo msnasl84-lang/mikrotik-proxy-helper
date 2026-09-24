@@ -11,10 +11,11 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} \
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS xray-build
 ARG TARGETOS TARGETARCH TARGETVARIANT
 ARG XRAY_VERSION=v26.7.11
-ENV GOBIN=/out
 RUN apk add --no-cache git ca-certificates
+RUN git clone --depth 1 --branch ${XRAY_VERSION} https://github.com/XTLS/Xray-core.git /src/xray
+WORKDIR /src/xray
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} \
-   go install -trimpath -ldflags="-s -w" github.com/xtls/xray-core/v26/main@${XRAY_VERSION}
+    go build -trimpath -ldflags="-s -w" -o /out/xray ./main
 
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates tzdata && addgroup -S helper && adduser -S -G helper helper
