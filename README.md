@@ -11,7 +11,7 @@
 - RouterOS remains responsible for stopping Xray, validating/applying the pending config, starting Xray, and rolling back.
 - Secrets are runtime data and are not embedded in the image.
 
-## Version 0.2 scope
+## Version 0.3 development scope
 
 - HTTP subscription download.
 - Base64 or plain-text subscription parsing.
@@ -26,6 +26,13 @@
 - Graceful `SIGTERM`/`SIGINT` shutdown with an eight-second deadline.
 - A process lock in `/data/helper.lock` to prevent concurrent helper instances.
 - Health worker cancellation during shutdown.
+- An isolated, short-lived Xray process for testing one inactive profile.
+- Loopback-only test SOCKS listeners allocated from a bounded port pool.
+- Per-test total, startup, and HTTP timeouts with deterministic process cleanup.
+- Sequential Test All with one isolated Xray probe at a time.
+- Live progress events over authenticated SSE.
+- Cancellation of the active Test All run.
+- Atomic retention of the latest 20 completed test runs.
 
 Other protocols are detected but intentionally marked unsupported until their core adapters are implemented.
 
@@ -49,6 +56,23 @@ Other protocols are detected but intentionally marked unsupported until their co
 | `HEALTH_FAILURE_LIMIT` | `3` |
 | `HELPER_USER` | `admin` |
 | `HELPER_PASSWORD` | empty; set in production to enable HTTP Basic authentication |
+| `XRAY_BINARY` | `/usr/local/bin/xray` |
+| `TEST_URL` | Cloudflare trace URL |
+| `TEST_START_TIMEOUT_SECONDS` | `4` |
+| `TEST_HTTP_TIMEOUT_SECONDS` | `10` |
+| `TEST_TOTAL_TIMEOUT_SECONDS` | `15` |
+| `TEST_PORT_MIN` / `TEST_PORT_MAX` | `12000` / `12031` |
+| `TEST_ALL_CONCURRENCY` | `1` |
+
+## Test API
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/tests/profile` | Test one profile through an isolated Xray process. |
+| `POST /api/tests/all` | Start a sequential Test All run. |
+| `POST /api/tests/cancel` | Cancel the active Test All run. |
+| `GET /api/tests` | Return retained completed runs. |
+| `GET /api/events` | Stream live test events using SSE. |
 
 ## Build
 
@@ -67,6 +91,6 @@ Before publishing, replace `OWNER` in `go.mod` with the GitHub owner if desired.
 - RouterOS coordinator script.
 - Xray binary validation of pending configuration.
 - Atomic activation/rollback.
-- Sequential testing of inactive profiles.
+- Multi-connection testing.
 - Multi-core support for sing-box.
 - Optional failover policy.

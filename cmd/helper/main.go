@@ -24,27 +24,17 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/OWNER/mikrotik-proxy-helper/internal/model"
+	"github.com/OWNER/mikrotik-proxy-helper/internal/events"
+	"github.com/OWNER/mikrotik-proxy-helper/internal/portpool"
+	"github.com/OWNER/mikrotik-proxy-helper/internal/results"
+	"github.com/OWNER/mikrotik-proxy-helper/internal/testengine"
 )
 
-const version = "0.2.0"
+const version = "0.3.0-dev.2"
 
-type Profile struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	Scheme       string `json:"scheme"`
-	Host         string `json:"host"`
-	Port         int    `json:"port"`
-	UUID         string `json:"uuid,omitempty"`
-	Type         string `json:"type,omitempty"`
-	Security     string `json:"security,omitempty"`
-	HeaderType   string `json:"header_type,omitempty"`
-	Path         string `json:"path,omitempty"`
-	SNI          string `json:"sni,omitempty"`
-	RequiredCore string `json:"required_core"`
-	Supported    bool   `json:"supported"`
-	Reason       string `json:"reason,omitempty"`
-	Raw          string `json:"-"`
-}
+type Profile = model.Profile
 
 type Health struct {
 	Status        string    `json:"status"`
@@ -79,14 +69,28 @@ type Config struct {
 	FailureLimit    int
 	AuthUser        string
 	AuthPassword    string
+	XrayBinary       string
+	RuntimeDir       string
+	TestURL          string
+	TestStartTimeout time.Duration
+	TestHTTPTimeout  time.Duration
+	TestTotalTimeout time.Duration
 }
 
 type App struct {
 	mu       sync.RWMutex
+	ctx      context.Context
 	cfg      Config
 	state    State
 	profiles []Profile
 	client   *http.Client
+	tests    *testengine.Engine
+	lastTests map[string]model.TestResult
+	events   *events.Broker
+	results  *results.Store
+	runMu    sync.Mutex
+	activeRun string
+	activeCancel context.CancelFunc
 }
 
 type ActionResponse struct {
@@ -132,16 +136,28 @@ func run() error {
 		FailureLimit:    envInt("HEALTH_FAILURE_LIMIT", 3),
 		AuthUser:        env("HELPER_USER", "admin"),
 		AuthPassword:    env("HELPER_PASSWORD", ""),
+		XrayBinary:      env("XRAY_BINARY", "/usr/local/bin/xray"),
+		RuntimeDir:      filepath.Join(env("DATA_DIR", "/data"), "runtime"),
+		TestURL:         env("TEST_URL", "https://www.cloudflare.com/cdn-cgi/trace"),
+		TestStartTimeout: time.Duration(envInt("TEST_START_TIMEOUT_SECONDS", 4)) * time.Second,
+		TestHTTPTimeout: time.Duration(envInt("TEST_HTTP_TIMEOUT_SECONDS", 10)) * time.Second,
+		TestTotalTimeout: time.Duration(envInt("TEST_TOTAL_TIMEOUT_SECONDS", 15)) * time.Second,
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
+	if err := cleanupRuntime(cfg.RuntimeDir); err != nil { return err }
 	lockFile, err := acquireInstanceLock(filepath.Join(cfg.DataDir, "helper.lock"))
 	if err != nil { return err }
 	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); _ = lockFile.Close() }()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	app := &App{cfg: cfg, state: State{Mode: "manual-health", Health: Health{Status: "unknown"}}}
+	ports, err := portpool.New(envInt("TEST_PORT_MIN", 12000), envInt("TEST_PORT_MAX", 12031))
+	if err != nil { return err }
+	app := &App{ctx: ctx, cfg: cfg, state: State{Mode: "manual-health", Health: Health{Status: "unknown"}}, lastTests: make(map[string]model.TestResult), events: events.New()}
+	app.results = results.New(filepath.Join(cfg.DataDir, "test-results.json"), 20)
+	if err := app.results.Load(); err != nil { log.Printf("test results load: %v", err) }
+	app.tests = testengine.New(testengine.Config{XrayBinary:cfg.XrayBinary, RuntimeDir:cfg.RuntimeDir, TestURL:cfg.TestURL, StartTimeout:cfg.TestStartTimeout, HTTPTimeout:cfg.TestHTTPTimeout, TotalTimeout:cfg.TestTotalTimeout, StopTimeout:2*time.Second, Concurrency:envInt("TEST_ALL_CONCURRENCY", 1)}, ports)
 	app.client = app.proxyHTTPClient()
 	if err := app.loadState(); err != nil {
 		log.Printf("state load: %v", err)
@@ -159,6 +175,11 @@ func run() error {
 	mux.HandleFunc("/api/refresh", app.auth(app.handleRefresh))
 	mux.HandleFunc("/api/select", app.auth(app.handleSelect))
 	mux.HandleFunc("/api/health", app.auth(app.handleHealth))
+	mux.HandleFunc("/api/tests/profile", app.auth(app.handleTestProfile))
+	mux.HandleFunc("/api/tests/all", app.auth(app.handleTestAll))
+	mux.HandleFunc("/api/tests/cancel", app.auth(app.handleCancelTest))
+	mux.HandleFunc("/api/tests", app.auth(app.handleTestHistory))
+	mux.HandleFunc("/api/events", app.auth(app.handleEvents))
 	server := &http.Server{Addr: cfg.ListenAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	log.Printf("mikrotik-proxy-helper %s listening on %s", version, cfg.ListenAddr)
 	serverErr := make(chan error, 1)
@@ -175,6 +196,18 @@ func run() error {
 		log.Printf("shutdown complete")
 		return nil
 	}
+}
+
+func cleanupRuntime(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil { return err }
+	entries, err := os.ReadDir(dir)
+	if err != nil { return err }
+	for _, entry := range entries {
+		if entry.Type().IsRegular() && strings.HasPrefix(entry.Name(), "probe-") && strings.HasSuffix(entry.Name(), ".json") {
+			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil { return err }
+		}
+	}
+	return nil
 }
 
 func acquireInstanceLock(path string) (*os.File, error) {
@@ -319,17 +352,26 @@ func parseProfile(raw string) Profile {
 	if p.Scheme == "vless" {
 		p.UUID = u.User.Username()
 		p.RequiredCore = "xray"
-		p.Supported = p.Host != "" && p.Port > 0 && p.UUID != "" &&
+		p.Supported = p.Host != "" && p.Port > 0 && validUUID(p.UUID) &&
 			(p.Type == "" || p.Type == "tcp" || p.Type == "raw") &&
 			(p.Security == "" || p.Security == "none")
-		if !p.Supported { p.Reason = "v0.2 supports VLESS raw/TCP with security=none only" }
+		if !p.Supported { p.Reason = "v0.3 supports VLESS raw/TCP with security=none only" }
 	} else {
-		p.Reason = "protocol detected but not enabled in v0.2"
+		p.Reason = "protocol detected but not enabled in v0.3"
 	}
 	identity := strings.Join([]string{p.Scheme, p.UUID, strings.ToLower(p.Host), strconv.Itoa(p.Port), q.Encode()}, "|")
 	sum := sha256.Sum256([]byte(identity))
 	p.ID = hex.EncodeToString(sum[:8])
 	return p
+}
+
+func validUUID(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' { return false }
+	for i, r := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 { continue }
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) { return false }
+	}
+	return true
 }
 
 func (a *App) handleRefresh(w http.ResponseWriter, r *http.Request) {
@@ -460,6 +502,95 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	a.writeAction(w,status,ok,"health",message,h)
 }
 
+func (a *App) handleTestProfile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost { http.Error(w,"POST required",http.StatusMethodNotAllowed); return }
+	id := strings.TrimSpace(r.FormValue("id"))
+	a.mu.RLock()
+	var profile *Profile
+	for i := range a.profiles { if a.profiles[i].ID == id { copy := a.profiles[i]; profile = &copy; break } }
+	a.mu.RUnlock()
+	if profile == nil { a.writeAction(w,http.StatusNotFound,false,"test-profile","Profile not found",nil); return }
+	testCtx, cancel := context.WithCancel(r.Context())
+	stopOnShutdown := context.AfterFunc(a.ctx, cancel)
+	defer func() { stopOnShutdown(); cancel() }()
+	result := a.tests.TestProfile(testCtx, *profile)
+	a.mu.Lock(); a.lastTests[result.ProfileID] = result; a.mu.Unlock()
+	status := http.StatusOK
+	if result.Status != "healthy" { status = http.StatusBadGateway }
+	a.writeAction(w,status,result.Status == "healthy","test-profile","Profile test completed",result)
+}
+
+func (a *App) handleTestAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost { http.Error(w,"POST required",http.StatusMethodNotAllowed); return }
+	a.runMu.Lock()
+	if a.activeRun != "" {
+		runID := a.activeRun
+		a.runMu.Unlock()
+		a.writeAction(w,http.StatusConflict,false,"test-all","Another Test All run is active",map[string]any{"run_id":runID})
+		return
+	}
+	runID := fmt.Sprintf("run-%d", time.Now().UTC().UnixNano())
+	runCtx, cancel := context.WithCancel(a.ctx)
+	a.activeRun, a.activeCancel = runID, cancel
+	a.runMu.Unlock()
+	a.mu.RLock(); profiles := append([]Profile(nil), a.profiles...); a.mu.RUnlock()
+	startedAt := time.Now().UTC()
+	a.events.Publish(events.Event{Type:"run-started", Data:map[string]any{"run_id":runID,"total":len(profiles),"started_at":startedAt}})
+	go func() {
+		defer cancel()
+		collected := a.tests.TestAll(runCtx, profiles, func(index, total int, result model.TestResult) {
+			a.mu.Lock(); a.lastTests[result.ProfileID] = result; a.mu.Unlock()
+			a.events.Publish(events.Event{Type:"profile-result", Data:map[string]any{"run_id":runID,"index":index,"total":total,"result":result}})
+		})
+		status := "completed"
+		if runCtx.Err() != nil { status = "cancelled" }
+		run := results.Run{ID:runID, Status:status, Results:collected, StartedAt:startedAt.Format(time.RFC3339Nano), EndedAt:time.Now().UTC().Format(time.RFC3339Nano)}
+		if err := a.results.Save(run); err != nil { log.Printf("save test results: %v", err) }
+		a.events.Publish(events.Event{Type:"run-completed", Data:run})
+		a.runMu.Lock()
+		if a.activeRun == runID { a.activeRun, a.activeCancel = "", nil }
+		a.runMu.Unlock()
+	}()
+	w.Header().Set("Retry-After", "1")
+	a.writeAction(w,http.StatusAccepted,true,"test-all","Test All started",map[string]any{"run_id":runID,"profiles":len(profiles)})
+}
+
+func (a *App) handleCancelTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost { http.Error(w,"POST required",http.StatusMethodNotAllowed); return }
+	a.runMu.Lock(); runID, cancel := a.activeRun, a.activeCancel; a.runMu.Unlock()
+	if cancel == nil { a.writeAction(w,http.StatusConflict,false,"cancel-test","No Test All run is active",nil); return }
+	cancel()
+	a.writeAction(w,http.StatusOK,true,"cancel-test","Cancellation requested",map[string]any{"run_id":runID})
+}
+
+func (a *App) handleTestHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet { http.Error(w,"GET required",http.StatusMethodNotAllowed); return }
+	w.Header().Set("Content-Type","application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"runs":a.results.Snapshot()})
+}
+
+func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet { http.Error(w,"GET required",http.StatusMethodNotAllowed); return }
+	flusher, ok := w.(http.Flusher)
+	if !ok { http.Error(w,"streaming unsupported",http.StatusInternalServerError); return }
+	w.Header().Set("Content-Type","text/event-stream")
+	w.Header().Set("Cache-Control","no-cache")
+	w.Header().Set("Connection","keep-alive")
+	stream, unsubscribe := a.events.Subscribe(); defer unsubscribe()
+	keepalive := time.NewTicker(15*time.Second); defer keepalive.Stop()
+	_, _ = io.WriteString(w, ": connected\n\n"); flusher.Flush()
+	for {
+		select {
+		case <-r.Context().Done(): return
+		case payload, open := <-stream:
+			if !open { return }
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", payload); flusher.Flush()
+		case <-keepalive.C:
+			_, _ = io.WriteString(w, ": keepalive\n\n"); flusher.Flush()
+		}
+	}
+}
+
 func (a *App) writeAction(w http.ResponseWriter, status int, ok bool, action, message string, details any) {
 	w.Header().Set("Content-Type","application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -470,24 +601,29 @@ func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) { a.writeStat
 func (a *App) writeStatus(w http.ResponseWriter) { a.mu.RLock(); defer a.mu.RUnlock(); a.writeStatusLocked(w) }
 func (a *App) writeStatusLocked(w http.ResponseWriter) {
 	w.Header().Set("Content-Type","application/json")
-	json.NewEncoder(w).Encode(map[string]any{"version":version,"state":a.state,"profiles":a.profiles})
+	a.runMu.Lock(); activeRun := a.activeRun; a.runMu.Unlock()
+	json.NewEncoder(w).Encode(map[string]any{"version":version,"state":a.state,"profiles":a.profiles,"last_tests":a.lastTests,"active_run":activeRun})
 }
 
 const page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MikroTik Proxy Helper</title><style>
 :root{color-scheme:dark;--bg:#0b1016;--panel:#121a23;--line:#293443;--text:#edf3f8;--muted:#98a8b8;--cyan:#67e8f9;--green:#4ade80;--yellow:#facc15;--red:#fb7185}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:1120px;margin:0 auto;padding:28px 18px 50px;background:var(--bg);color:var(--text)}h1{margin:0 0 18px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}.label{font-size:.78rem;color:var(--muted);text-transform:uppercase}.value{margin-top:6px;font-weight:700;color:var(--cyan)}.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}button{border:1px solid #42536a;border-radius:8px;background:#1c2a3a;color:var(--text);padding:9px 14px;cursor:pointer;font-weight:650}button:hover{background:#26384d}button:disabled{opacity:.5;cursor:wait}table{width:100%;border-collapse:collapse}th,td{padding:11px 9px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted);font-size:.85rem}.selected{background:#102a25}.ok{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}#log{height:235px;overflow:auto;white-space:pre-wrap;margin:0;background:#080c11;border:1px solid var(--line);border-radius:8px;padding:12px;color:#cbd5e1;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.panel-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.panel-head h2{margin:0;font-size:1.15rem}.small{font-size:.84rem;color:var(--muted)}@media(max-width:720px){.cards{grid-template-columns:1fr}table{display:block;overflow-x:auto}}
-</style></head><body><h1>MikroTik Proxy Helper</h1><section class="cards"><div class="card"><div class="label">Mode</div><div class="value" id="mode">Loading…</div></div><div class="card"><div class="label">Health</div><div class="value" id="health">Loading…</div></div><div class="card"><div class="label">Latency</div><div class="value" id="latency">—</div></div></section><div class="toolbar"><button id="refresh">Refresh subscription</button><button id="test">Test active tunnel</button></div><section class="panel"><div class="panel-head"><h2>Profiles</h2><span class="small" id="count"></span></div><table><thead><tr><th>Name</th><th>Endpoint</th><th>Protocol</th><th>Supported</th><th>Action</th></tr></thead><tbody id="profiles"></tbody></table></section><section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Operation log</h2><button id="clear">Clear log</button></div><pre id="log" aria-live="polite"></pre></section><script>
+</style></head><body><h1>MikroTik Proxy Helper</h1><section class="cards"><div class="card"><div class="label">Mode</div><div class="value" id="mode">Loading…</div></div><div class="card"><div class="label">Health</div><div class="value" id="health">Loading…</div></div><div class="card"><div class="label">Latency</div><div class="value" id="latency">—</div></div></section><div class="toolbar"><button id="refresh">Refresh subscription</button><button id="test">Test active tunnel</button><button id="testAll">Test all tunnels</button><button id="cancelTest">Cancel current test</button></div><section class="panel"><div class="panel-head"><h2>Profiles</h2><span class="small" id="count"></span></div><table><thead><tr><th>Name</th><th>Endpoint</th><th>Protocol</th><th>Supported</th><th>Last test</th><th>Action</th></tr></thead><tbody id="profiles"></tbody></table></section><section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Operation log</h2><button id="clear">Clear log</button></div><pre id="log" aria-live="polite"></pre></section><script>
 const logBox=document.getElementById('log');
 function line(message,kind='info'){const t=new Date().toLocaleTimeString();const mark=kind==='ok'?'OK':kind==='bad'?'ERROR':'INFO';logBox.textContent+='['+t+'] ['+mark+'] '+message+'\n';logBox.scrollTop=logBox.scrollHeight}
 function text(id,value){document.getElementById(id).textContent=value}
 function healthClass(status){return status==='healthy'?'ok':status==='unhealthy'?'bad':'warn'}
 async function request(path,options={}){const response=await fetch(path,options);let data;try{data=await response.json()}catch{throw new Error('HTTP '+response.status)}if(!response.ok||data.ok===false){throw new Error(data.message+(data.details&&data.details.error?': '+data.details.error:''))}return data}
-async function loadStatus(){const data=await request('/api/status');const state=data.state;text('mode',state.mode);const h=document.getElementById('health');h.textContent=state.health.status;h.className='value '+healthClass(state.health.status);text('latency',state.health.latency_ms?state.health.latency_ms+' ms':'—');renderProfiles(data.profiles,state.selected_profile);return data}
-function renderProfiles(profiles,selected){const body=document.getElementById('profiles');body.replaceChildren();text('count',profiles.length+' profile(s)');for(const p of profiles){const tr=document.createElement('tr');if(p.id===selected)tr.className='selected';for(const value of [p.name,p.host+':'+p.port,p.scheme+'/'+(p.type||'raw')]){const td=document.createElement('td');td.textContent=value;tr.appendChild(td)}const supported=document.createElement('td');supported.textContent=p.supported?'Yes':'No — '+(p.reason||'unsupported');supported.className=p.supported?'ok':'bad';tr.appendChild(supported);const action=document.createElement('td');const button=document.createElement('button');button.textContent=p.id===selected?'Prepared':'Prepare';button.disabled=!p.supported;button.onclick=()=>prepare(p,button);action.appendChild(button);tr.appendChild(action);body.appendChild(tr)}}
+async function loadStatus(){const data=await request('/api/status');const state=data.state;text('mode',state.mode);const h=document.getElementById('health');h.textContent=state.health.status;h.className='value '+healthClass(state.health.status);text('latency',state.health.latency_ms?state.health.latency_ms+' ms':'—');renderProfiles(data.profiles,state.selected_profile,data.last_tests||{});return data}
+function renderProfiles(profiles,selected,lastTests){const body=document.getElementById('profiles');body.replaceChildren();text('count',profiles.length+' profile(s)');for(const p of profiles){const tr=document.createElement('tr');if(p.id===selected)tr.className='selected';for(const value of [p.name,p.host+':'+p.port,p.scheme+'/'+(p.type||'raw')]){const td=document.createElement('td');td.textContent=value;tr.appendChild(td)}const supported=document.createElement('td');supported.textContent=p.supported?'Yes':'No — '+(p.reason||'unsupported');supported.className=p.supported?'ok':'bad';tr.appendChild(supported);const last=document.createElement('td');const result=lastTests[p.id];last.textContent=result?result.status:'—';last.className=result?(result.status==='healthy'?'ok':result.status==='unsupported'?'warn':'bad'):'';tr.appendChild(last);const action=document.createElement('td');const prepareButton=document.createElement('button');prepareButton.textContent=p.id===selected?'Prepared':'Prepare';prepareButton.disabled=!p.supported;prepareButton.onclick=()=>prepare(p,prepareButton);action.appendChild(prepareButton);const testButton=document.createElement('button');testButton.textContent='Test';testButton.style.marginLeft='6px';testButton.disabled=!p.supported;testButton.onclick=()=>testProfile(p,testButton);action.appendChild(testButton);tr.appendChild(action);body.appendChild(tr)}}
 async function busy(button,work){button.disabled=true;const old=button.textContent;button.textContent='Working…';try{await work()}finally{button.disabled=false;button.textContent=old}}
 async function prepare(profile,button){line('Preparing profile: '+profile.name);await busy(button,async()=>{try{const form=new URLSearchParams({id:profile.id});const r=await request('/api/select',{method:'POST',body:form});line(r.message+' — '+r.details.name+' — '+r.details.endpoint,'ok');await loadStatus()}catch(e){line(e.message,'bad')}})}
+async function testProfile(profile,button){line('Testing profile in an isolated Xray: '+profile.name);await busy(button,async()=>{try{const form=new URLSearchParams({id:profile.id});const r=await request('/api/tests/profile',{method:'POST',body:form});line(r.message+' — '+r.details.status+' — TTFB '+r.details.ttfb_ms+' ms','ok')}catch(e){line(e.message,'bad')}})}
 document.getElementById('refresh').onclick=e=>busy(e.currentTarget,async()=>{line('Downloading subscription…');try{const r=await request('/api/refresh',{method:'POST'});line(r.message+' — profiles found: '+r.details.profiles,'ok');await loadStatus()}catch(e){line(e.message,'bad')}});
 document.getElementById('test').onclick=e=>busy(e.currentTarget,async()=>{line('Testing active tunnel…');try{const r=await request('/api/health',{method:'POST'});line(r.message+' — latency: '+r.details.latency_ms+' ms','ok');await loadStatus()}catch(e){line(e.message,'bad');await loadStatus()}});
+document.getElementById('testAll').onclick=e=>busy(e.currentTarget,async()=>{line('Starting sequential Test All…');try{const r=await request('/api/tests/all',{method:'POST'});line(r.message+' — '+r.details.profiles+' profiles','ok')}catch(e){line(e.message,'bad')}});
+document.getElementById('cancelTest').onclick=e=>busy(e.currentTarget,async()=>{try{const r=await request('/api/tests/cancel',{method:'POST'});line(r.message+' — '+r.details.run_id)}catch(e){line(e.message,'bad')}});
 document.getElementById('clear').onclick=()=>{logBox.textContent=''};
+const eventStream=new EventSource('/api/events');eventStream.onmessage=async event=>{try{const message=JSON.parse(event.data);if(message.type==='profile-result'){const r=message.data.result;line('['+(message.data.index+1)+'/'+message.data.total+'] '+r.profile_name+' — '+r.status,r.status==='healthy'?'ok':r.status==='unsupported'?'info':'bad');await loadStatus()}else if(message.type==='run-completed'){line('Test All '+message.data.status+' — '+message.data.results.length+' results',message.data.status==='completed'?'ok':'bad')}}catch(e){line('Invalid live event','bad')}};eventStream.onerror=()=>line('Live event stream reconnecting…');
 loadStatus().then(()=>line('Helper interface ready','ok')).catch(e=>line(e.message,'bad'));
 </script></body></html>`
 
