@@ -1,6 +1,10 @@
 # MikroTik Proxy Helper
 
-## Version 0.3.0-dev.5
+## Version 0.3.0-dev.6
+
+This release separates profile preparation from activation and adds file-based
+RouterOS mode requests for `vless`, `ovpn`, `blocked`, and `direct`. RouterOS
+remains the only privileged controller; the Helper stores no router password.
 
 - Close SSE streams when the application context is cancelled.
 - Allow an intentional RouterOS container stop to finish without reaching the HTTP shutdown deadline.

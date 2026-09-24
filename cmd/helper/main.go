@@ -32,7 +32,7 @@ import (
 	"github.com/OWNER/mikrotik-proxy-helper/internal/testengine"
 )
 
-const version = "0.3.0-dev.5"
+const version = "0.3.0-dev.6"
 
 type Profile = model.Profile
 
@@ -99,6 +99,18 @@ type ActionResponse struct {
 	Message   string    `json:"message"`
 	Timestamp time.Time `json:"timestamp"`
 	Details   any       `json:"details,omitempty"`
+}
+
+type RouterStatus struct {
+	Mode          string    `json:"mode"`
+	DesiredMode   string    `json:"desired_mode,omitempty"`
+	ActiveProfile string    `json:"active_profile,omitempty"`
+	Xray          string    `json:"xray,omitempty"`
+	Tun2Socks     string    `json:"tun2socks,omitempty"`
+	Route         string    `json:"route,omitempty"`
+	OVPN          string    `json:"ovpn,omitempty"`
+	Message       string    `json:"message,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
 }
 
 func env(key, fallback string) string {
@@ -175,6 +187,8 @@ func run() error {
 	mux.HandleFunc("/api/status", app.auth(app.handleStatus))
 	mux.HandleFunc("/api/refresh", app.auth(app.handleRefresh))
 	mux.HandleFunc("/api/select", app.auth(app.handleSelect))
+	mux.HandleFunc("/api/activate", app.auth(app.handleActivate))
+	mux.HandleFunc("/api/mode", app.auth(app.handleMode))
 	mux.HandleFunc("/api/health", app.auth(app.handleHealth))
 	mux.HandleFunc("/api/tests/profile", app.auth(app.handleTestProfile))
 	mux.HandleFunc("/api/tests/all", app.auth(app.handleTestAll))
@@ -407,13 +421,45 @@ func (a *App) handleSelect(w http.ResponseWriter, r *http.Request) {
 	if err := writeJSONAtomic(filepath.Join(a.cfg.XrayConfigDir, "config.pending.json"), config, 0o600); err != nil {
 		a.writeAction(w,http.StatusInternalServerError,false,"prepare","Could not write pending configuration",map[string]any{"error":err.Error()}); return
 	}
-	request := map[string]any{"action":"apply-profile","profile_id":selected.ID,"created_at":time.Now().UTC()}
-	if err := writeJSONAtomic(filepath.Join(a.cfg.DataDir, "apply-request.json"), request, 0o600); err != nil {
-		a.writeAction(w,http.StatusInternalServerError,false,"prepare","Could not write apply request",map[string]any{"error":err.Error()}); return
-	}
 	a.state.SelectedProfile = selected.ID
 	_ = a.saveStateLocked()
 	a.writeAction(w,http.StatusOK,true,"prepare","Pending configuration created",map[string]any{"profile_id":selected.ID,"name":selected.Name,"endpoint":net.JoinHostPort(selected.Host,strconv.Itoa(selected.Port)),"protocol":selected.Scheme+"/"+selected.Type})
+}
+
+func (a *App) handleActivate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost { http.Error(w, "POST required", http.StatusMethodNotAllowed); return }
+	id := strings.TrimSpace(r.FormValue("id"))
+	a.mu.RLock()
+	selected := a.state.SelectedProfile
+	var name string
+	for i := range a.profiles { if a.profiles[i].ID == id { name = a.profiles[i].Name; break } }
+	a.mu.RUnlock()
+	if id == "" || id != selected { a.writeAction(w,http.StatusConflict,false,"activate","Prepare this profile before activation",nil); return }
+	if name == "" { a.writeAction(w,http.StatusNotFound,false,"activate","Profile not found",nil); return }
+	request := map[string]any{"action":"apply-profile","profile_id":id,"created_at":time.Now().UTC()}
+	if err := writeJSONAtomic(filepath.Join(a.cfg.DataDir, "apply-request.json"), request, 0o600); err != nil {
+		a.writeAction(w,http.StatusInternalServerError,false,"activate","Could not write activation request",map[string]any{"error":err.Error()}); return
+	}
+	a.writeAction(w,http.StatusAccepted,true,"activate","Activation request queued",map[string]any{"profile_id":id,"name":name})
+}
+
+func (a *App) handleMode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost { http.Error(w, "POST required", http.StatusMethodNotAllowed); return }
+	mode := strings.ToLower(strings.TrimSpace(r.FormValue("mode")))
+	allowed := map[string]bool{"vless":true,"ovpn":true,"blocked":true,"direct":true}
+	if !allowed[mode] { a.writeAction(w,http.StatusUnprocessableEntity,false,"mode","Unsupported mode",nil); return }
+	request := map[string]any{"action":"set-mode","mode":mode,"created_at":time.Now().UTC()}
+	if err := writeJSONAtomic(filepath.Join(a.cfg.DataDir, "mode-request.json"), request, 0o600); err != nil {
+		a.writeAction(w,http.StatusInternalServerError,false,"mode","Could not write mode request",map[string]any{"error":err.Error()}); return
+	}
+	a.writeAction(w,http.StatusAccepted,true,"mode","Mode change request queued",map[string]any{"mode":mode})
+}
+
+func (a *App) routerStatus() RouterStatus {
+	var status RouterStatus
+	b, err := os.ReadFile(filepath.Join(a.cfg.DataDir, "router-status.json"))
+	if err == nil { _ = json.Unmarshal(b, &status) }
+	return status
 }
 
 func makeXrayConfig(p Profile) map[string]any {
@@ -617,28 +663,30 @@ func (a *App) writeStatus(w http.ResponseWriter) { a.mu.RLock(); defer a.mu.RUnl
 func (a *App) writeStatusLocked(w http.ResponseWriter) {
 	w.Header().Set("Content-Type","application/json")
 	a.runMu.Lock(); activeRun := a.activeRun; a.runMu.Unlock()
-	json.NewEncoder(w).Encode(map[string]any{"version":version,"state":a.state,"profiles":a.profiles,"last_tests":a.lastTests,"active_run":activeRun})
+	json.NewEncoder(w).Encode(map[string]any{"version":version,"state":a.state,"router":a.routerStatus(),"profiles":a.profiles,"last_tests":a.lastTests,"active_run":activeRun})
 }
 
 const page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MikroTik Proxy Helper</title><style>
 :root{color-scheme:dark;--bg:#0b1016;--panel:#121a23;--line:#293443;--text:#edf3f8;--muted:#98a8b8;--cyan:#67e8f9;--green:#4ade80;--yellow:#facc15;--red:#fb7185}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:1120px;margin:0 auto;padding:28px 18px 50px;background:var(--bg);color:var(--text)}h1{margin:0 0 18px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}.label{font-size:.78rem;color:var(--muted);text-transform:uppercase}.value{margin-top:6px;font-weight:700;color:var(--cyan)}.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}button{border:1px solid #42536a;border-radius:8px;background:#1c2a3a;color:var(--text);padding:9px 14px;cursor:pointer;font-weight:650}button:hover{background:#26384d}button:disabled{opacity:.5;cursor:wait}table{width:100%;border-collapse:collapse}th,td{padding:11px 9px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted);font-size:.85rem}.selected{background:#102a25}.ok{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}#log{height:235px;overflow:auto;white-space:pre-wrap;margin:0;background:#080c11;border:1px solid var(--line);border-radius:8px;padding:12px;color:#cbd5e1;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.panel-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.panel-head h2{margin:0;font-size:1.15rem}.small{font-size:.84rem;color:var(--muted)}@media(max-width:720px){.cards{grid-template-columns:1fr}table{display:block;overflow-x:auto}}
-</style></head><body><h1>MikroTik Proxy Helper</h1><section class="cards"><div class="card"><div class="label">Mode</div><div class="value" id="mode">Loading…</div></div><div class="card"><div class="label">Health</div><div class="value" id="health">Loading…</div></div><div class="card"><div class="label">Latency</div><div class="value" id="latency">—</div></div></section><div class="toolbar"><button id="refresh">Refresh subscription</button><button id="test">Test active tunnel</button><button id="testAll">Test all tunnels</button><button id="cancelTest">Cancel current test</button></div><section class="panel"><div class="panel-head"><h2>Profiles</h2><span class="small" id="count"></span></div><table><thead><tr><th>Name</th><th>Endpoint</th><th>Protocol</th><th>Supported</th><th>Status</th><th>Latency (TTFB)</th><th>Action</th></tr></thead><tbody id="profiles"></tbody></table></section><section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Operation log</h2><button id="clear">Clear log</button></div><pre id="log" aria-live="polite"></pre></section><script>
+</style></head><body><h1>MikroTik Proxy Helper</h1><section class="cards"><div class="card"><div class="label">Router mode</div><div class="value" id="mode">Loading…</div></div><div class="card"><div class="label">Health</div><div class="value" id="health">Loading…</div></div><div class="card"><div class="label">Latency</div><div class="value" id="latency">—</div></div></section><div class="toolbar"><button data-mode="vless">Enable VLESS</button><button data-mode="blocked">Disable VLESS</button><button data-mode="ovpn">Use OVPN</button><button data-mode="direct">Direct WAN</button></div><div class="toolbar"><button id="refresh">Refresh subscription</button><button id="test">Test active tunnel</button><button id="testAll">Test all tunnels</button><button id="cancelTest">Cancel current test</button></div><section class="panel"><div class="panel-head"><h2>Service state</h2><span class="small" id="services">Waiting for RouterOS status…</span></div></section><section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Profiles</h2><span class="small" id="count"></span></div><table><thead><tr><th>Name</th><th>Endpoint</th><th>Protocol</th><th>Supported</th><th>Status</th><th>Latency (TTFB)</th><th>Action</th></tr></thead><tbody id="profiles"></tbody></table></section><section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Operation log</h2><button id="clear">Clear log</button></div><pre id="log" aria-live="polite"></pre></section><script>
 const logBox=document.getElementById('log');
 function line(message,kind='info'){const t=new Date().toLocaleTimeString();const mark=kind==='ok'?'OK':kind==='bad'?'ERROR':'INFO';logBox.textContent+='['+t+'] ['+mark+'] '+message+'\n';logBox.scrollTop=logBox.scrollHeight}
 function text(id,value){document.getElementById(id).textContent=value}
 function healthClass(status){return status==='healthy'?'ok':status==='unhealthy'?'bad':'warn'}
 function failureDetails(details){if(!details)return '';const code=details.error_code||'';const message=details.error_message||details.error||'';if(code&&message)return code+': '+message;return message||code}
 async function request(path,options={}){const response=await fetch(path,options);let data;try{data=await response.json()}catch{throw new Error('HTTP '+response.status)}if(!response.ok||data.ok===false){const detail=failureDetails(data.details);throw new Error(data.message+(detail?': '+detail:''))}return data}
-async function loadStatus(){const data=await request('/api/status');const state=data.state;text('mode',state.mode);const h=document.getElementById('health');h.textContent=state.health.status;h.className='value '+healthClass(state.health.status);text('latency',state.health.latency_ms?state.health.latency_ms+' ms':'—');renderProfiles(data.profiles,state.selected_profile,data.last_tests||{});return data}
-function renderProfiles(profiles,selected,lastTests){const body=document.getElementById('profiles');body.replaceChildren();text('count',profiles.length+' profile(s)');const healthy=Object.values(lastTests).filter(r=>r.status==='healthy'&&r.ttfb_ms>0);const bestLatency=healthy.length?Math.min(...healthy.map(r=>r.ttfb_ms)):0;for(const p of profiles){const tr=document.createElement('tr');if(p.id===selected)tr.className='selected';for(const value of [p.name,p.host+':'+p.port,p.scheme+'/'+(p.type||'raw')]){const td=document.createElement('td');td.textContent=value;tr.appendChild(td)}const supported=document.createElement('td');supported.textContent=p.supported?'Yes':'No — '+(p.reason||'unsupported');supported.className=p.supported?'ok':'bad';tr.appendChild(supported);const result=lastTests[p.id];const last=document.createElement('td');last.textContent=result?result.status:'—';last.className=result?(result.status==='healthy'?'ok':result.status==='unsupported'?'warn':'bad'):'';tr.appendChild(last);const latency=document.createElement('td');if(result&&result.status==='healthy'&&result.ttfb_ms>0){const isBest=result.ttfb_ms===bestLatency;latency.textContent=result.ttfb_ms+' ms'+(isBest?' · Best':'');latency.className=isBest?'ok':''}else{latency.textContent='—'}tr.appendChild(latency);const action=document.createElement('td');const prepareButton=document.createElement('button');prepareButton.textContent=p.id===selected?'Prepared':'Prepare';prepareButton.disabled=!p.supported;prepareButton.onclick=()=>prepare(p,prepareButton);action.appendChild(prepareButton);const testButton=document.createElement('button');testButton.textContent='Test';testButton.style.marginLeft='6px';testButton.disabled=!p.supported;testButton.onclick=()=>testProfile(p,testButton);action.appendChild(testButton);tr.appendChild(action);body.appendChild(tr)}}
+async function loadStatus(){const data=await request('/api/status');const state=data.state;const router=data.router||{};text('mode',router.mode||'unknown');text('services','Xray: '+(router.xray||'unknown')+' · tun2socks: '+(router.tun2socks||'unknown')+' · route: '+(router.route||'unknown')+(router.ovpn?' · OVPN: '+router.ovpn:''));const h=document.getElementById('health');h.textContent=state.health.status;h.className='value '+healthClass(state.health.status);text('latency',state.health.latency_ms?state.health.latency_ms+' ms':'—');renderProfiles(data.profiles,state.selected_profile,router.active_profile||state.active_profile,data.last_tests||{});return data}
+function renderProfiles(profiles,selected,active,lastTests){const body=document.getElementById('profiles');body.replaceChildren();text('count',profiles.length+' profile(s)');const healthy=Object.values(lastTests).filter(r=>r.status==='healthy'&&r.ttfb_ms>0);const bestLatency=healthy.length?Math.min(...healthy.map(r=>r.ttfb_ms)):0;for(const p of profiles){const tr=document.createElement('tr');if(p.id===active)tr.className='selected';for(const value of [p.name,p.host+':'+p.port,p.scheme+'/'+(p.type||'raw')]){const td=document.createElement('td');td.textContent=value;tr.appendChild(td)}const supported=document.createElement('td');supported.textContent=p.supported?'Yes':'No — '+(p.reason||'unsupported');supported.className=p.supported?'ok':'bad';tr.appendChild(supported);const result=lastTests[p.id];const last=document.createElement('td');last.textContent=result?result.status:'—';last.className=result?(result.status==='healthy'?'ok':result.status==='unsupported'?'warn':'bad'):'';tr.appendChild(last);const latency=document.createElement('td');if(result&&result.status==='healthy'&&result.ttfb_ms>0){const isBest=result.ttfb_ms===bestLatency;latency.textContent=result.ttfb_ms+' ms'+(isBest?' · Best':'');latency.className=isBest?'ok':''}else{latency.textContent='—'}tr.appendChild(latency);const action=document.createElement('td');const prepareButton=document.createElement('button');prepareButton.textContent=p.id===selected?'Prepared':'Prepare';prepareButton.disabled=!p.supported;prepareButton.onclick=()=>prepare(p,prepareButton);action.appendChild(prepareButton);const activateButton=document.createElement('button');activateButton.textContent=p.id===active?'Active':'Activate';activateButton.style.marginLeft='6px';activateButton.disabled=!p.supported||p.id!==selected||p.id===active;activateButton.onclick=()=>activate(p,activateButton);action.appendChild(activateButton);const testButton=document.createElement('button');testButton.textContent='Test';testButton.style.marginLeft='6px';testButton.disabled=!p.supported;testButton.onclick=()=>testProfile(p,testButton);action.appendChild(testButton);tr.appendChild(action);body.appendChild(tr)}}
 async function busy(button,work){button.disabled=true;const old=button.textContent;button.textContent='Working…';try{await work()}finally{button.disabled=false;button.textContent=old}}
 async function prepare(profile,button){line('Preparing profile: '+profile.name);await busy(button,async()=>{try{const form=new URLSearchParams({id:profile.id});const r=await request('/api/select',{method:'POST',body:form});line(r.message+' — '+r.details.name+' — '+r.details.endpoint,'ok');await loadStatus()}catch(e){line(e.message,'bad')}})}
+async function activate(profile,button){line('Requesting activation: '+profile.name);await busy(button,async()=>{try{const form=new URLSearchParams({id:profile.id});const r=await request('/api/activate',{method:'POST',body:form});line(r.message+' — waiting for RouterOS','ok')}catch(e){line(e.message,'bad')}finally{setTimeout(loadStatus,2500)}})}
 async function testProfile(profile,button){line('Testing profile in an isolated Xray: '+profile.name);await busy(button,async()=>{try{const form=new URLSearchParams({id:profile.id});const r=await request('/api/tests/profile',{method:'POST',body:form});line(r.message+' — '+r.details.status+' — TTFB '+r.details.ttfb_ms+' ms','ok')}catch(e){line(e.message,'bad')}finally{await loadStatus()}})}
 document.getElementById('refresh').onclick=e=>busy(e.currentTarget,async()=>{line('Downloading subscription…');try{const r=await request('/api/refresh',{method:'POST'});line(r.message+' — profiles found: '+r.details.profiles,'ok');await loadStatus()}catch(e){line(e.message,'bad')}});
 document.getElementById('test').onclick=e=>busy(e.currentTarget,async()=>{line('Testing active tunnel…');try{const r=await request('/api/health',{method:'POST'});line(r.message+' — latency: '+r.details.latency_ms+' ms','ok');await loadStatus()}catch(e){line(e.message,'bad');await loadStatus()}});
 document.getElementById('testAll').onclick=e=>busy(e.currentTarget,async()=>{line('Starting sequential Test All…');try{const r=await request('/api/tests/all',{method:'POST'});line(r.message+' — '+r.details.profiles+' profiles','ok')}catch(e){line(e.message,'bad')}});
 document.getElementById('cancelTest').onclick=e=>busy(e.currentTarget,async()=>{try{const r=await request('/api/tests/cancel',{method:'POST'});line(r.message+' — '+r.details.run_id)}catch(e){line(e.message,'bad')}});
 document.getElementById('clear').onclick=()=>{logBox.textContent=''};
+for(const button of document.querySelectorAll('[data-mode]'))button.onclick=e=>busy(e.currentTarget,async()=>{const mode=e.currentTarget.dataset.mode;if(mode==='direct'&&!confirm('Direct mode bypasses the VPN kill switch. Continue?'))return;try{const form=new URLSearchParams({mode});const r=await request('/api/mode',{method:'POST',body:form});line(r.message+' — '+mode,'ok')}catch(err){line(err.message,'bad')}finally{setTimeout(loadStatus,2500)}});
 const eventStream=new EventSource('/api/events');eventStream.onmessage=async event=>{try{const message=JSON.parse(event.data);if(message.type==='profile-result'){const r=message.data.result;const detail=r.status==='healthy'?' — TTFB '+r.ttfb_ms+' ms':(failureDetails(r)?' — '+failureDetails(r):'');line('['+(message.data.index+1)+'/'+message.data.total+'] '+r.profile_name+' — '+r.status+detail,r.status==='healthy'?'ok':r.status==='unsupported'?'info':'bad');await loadStatus()}else if(message.type==='run-completed'){line('Test All '+message.data.status+' — '+message.data.results.length+' results',message.data.status==='completed'?'ok':'bad')}}catch(e){line('Invalid live event','bad')}};eventStream.onerror=()=>line('Live event stream reconnecting…');
 loadStatus().then(()=>line('Helper interface ready','ok')).catch(e=>line(e.message,'bad'));
 </script></body></html>`

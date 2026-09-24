@@ -47,6 +47,18 @@ func TestPageRefreshesSingleTestStatusAndShowsFailureDetails(t *testing.T) {
 	}
 }
 
+func TestPageSeparatesPreparedAndActiveProfiles(t *testing.T) {
+	for _, required := range []string{"Prepared", "Activate", "Active", "/api/activate"} {
+		if !strings.Contains(page, required) { t.Fatalf("page is missing %q", required) }
+	}
+}
+
+func TestPageProvidesRouterModes(t *testing.T) {
+	for _, mode := range []string{`data-mode="vless"`, `data-mode="ovpn"`, `data-mode="blocked"`, `data-mode="direct"`} {
+		if !strings.Contains(page, mode) { t.Fatalf("page is missing %q", mode) }
+	}
+}
+
 func TestRestoreLastTestsUsesNewestResultPerProfile(t *testing.T) {
 	runs := []results.Run{
 		{Results: []model.TestResult{{ProfileID: "a", Status: "timeout"}, {ProfileID: "b", Status: "healthy", TTFBMS: 300}}},
