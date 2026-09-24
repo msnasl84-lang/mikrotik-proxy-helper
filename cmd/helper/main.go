@@ -32,7 +32,7 @@ import (
 	"github.com/OWNER/mikrotik-proxy-helper/internal/testengine"
 )
 
-const version = "0.3.0-dev.2"
+const version = "0.3.0-dev.4"
 
 type Profile = model.Profile
 
@@ -157,6 +157,7 @@ func run() error {
 	app := &App{ctx: ctx, cfg: cfg, state: State{Mode: "manual-health", Health: Health{Status: "unknown"}}, lastTests: make(map[string]model.TestResult), events: events.New()}
 	app.results = results.New(filepath.Join(cfg.DataDir, "test-results.json"), 20)
 	if err := app.results.Load(); err != nil { log.Printf("test results load: %v", err) }
+	for id, result := range restoreLastTests(app.results.Snapshot()) { app.lastTests[id] = result }
 	app.tests = testengine.New(testengine.Config{XrayBinary:cfg.XrayBinary, RuntimeDir:cfg.RuntimeDir, TestURL:cfg.TestURL, StartTimeout:cfg.TestStartTimeout, HTTPTimeout:cfg.TestHTTPTimeout, TotalTimeout:cfg.TestTotalTimeout, StopTimeout:2*time.Second, Concurrency:envInt("TEST_ALL_CONCURRENCY", 1)}, ports)
 	app.client = app.proxyHTTPClient()
 	if err := app.loadState(); err != nil {
@@ -265,6 +266,16 @@ func writeJSONAtomic(path string, value any, mode os.FileMode) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func restoreLastTests(runs []results.Run) map[string]model.TestResult {
+	last := make(map[string]model.TestResult)
+	for _, run := range runs {
+		for _, result := range run.Results {
+			if result.ProfileID != "" { last[result.ProfileID] = result }
+		}
+	}
+	return last
 }
 
 func (a *App) refreshSubscription(ctx context.Context) error {
@@ -515,9 +526,12 @@ func (a *App) handleTestProfile(w http.ResponseWriter, r *http.Request) {
 	defer func() { stopOnShutdown(); cancel() }()
 	result := a.tests.TestProfile(testCtx, *profile)
 	a.mu.Lock(); a.lastTests[result.ProfileID] = result; a.mu.Unlock()
+	run := results.Run{ID:result.RunID, Status:"completed", Results:[]model.TestResult{result}, StartedAt:result.TestedAt.Format(time.RFC3339Nano), EndedAt:time.Now().UTC().Format(time.RFC3339Nano)}
+	if err := a.results.Save(run); err != nil { log.Printf("save profile test result: %v", err) }
 	status := http.StatusOK
-	if result.Status != "healthy" { status = http.StatusBadGateway }
-	a.writeAction(w,status,result.Status == "healthy","test-profile","Profile test completed",result)
+	message := "Profile test completed"
+	if result.Status != "healthy" { status = http.StatusBadGateway; message = "Profile test failed" }
+	a.writeAction(w,status,result.Status == "healthy","test-profile",message,result)
 }
 
 func (a *App) handleTestAll(w http.ResponseWriter, r *http.Request) {
@@ -607,23 +621,24 @@ func (a *App) writeStatusLocked(w http.ResponseWriter) {
 
 const page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MikroTik Proxy Helper</title><style>
 :root{color-scheme:dark;--bg:#0b1016;--panel:#121a23;--line:#293443;--text:#edf3f8;--muted:#98a8b8;--cyan:#67e8f9;--green:#4ade80;--yellow:#facc15;--red:#fb7185}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:1120px;margin:0 auto;padding:28px 18px 50px;background:var(--bg);color:var(--text)}h1{margin:0 0 18px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}.label{font-size:.78rem;color:var(--muted);text-transform:uppercase}.value{margin-top:6px;font-weight:700;color:var(--cyan)}.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}button{border:1px solid #42536a;border-radius:8px;background:#1c2a3a;color:var(--text);padding:9px 14px;cursor:pointer;font-weight:650}button:hover{background:#26384d}button:disabled{opacity:.5;cursor:wait}table{width:100%;border-collapse:collapse}th,td{padding:11px 9px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted);font-size:.85rem}.selected{background:#102a25}.ok{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}#log{height:235px;overflow:auto;white-space:pre-wrap;margin:0;background:#080c11;border:1px solid var(--line);border-radius:8px;padding:12px;color:#cbd5e1;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.panel-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.panel-head h2{margin:0;font-size:1.15rem}.small{font-size:.84rem;color:var(--muted)}@media(max-width:720px){.cards{grid-template-columns:1fr}table{display:block;overflow-x:auto}}
-</style></head><body><h1>MikroTik Proxy Helper</h1><section class="cards"><div class="card"><div class="label">Mode</div><div class="value" id="mode">Loading…</div></div><div class="card"><div class="label">Health</div><div class="value" id="health">Loading…</div></div><div class="card"><div class="label">Latency</div><div class="value" id="latency">—</div></div></section><div class="toolbar"><button id="refresh">Refresh subscription</button><button id="test">Test active tunnel</button><button id="testAll">Test all tunnels</button><button id="cancelTest">Cancel current test</button></div><section class="panel"><div class="panel-head"><h2>Profiles</h2><span class="small" id="count"></span></div><table><thead><tr><th>Name</th><th>Endpoint</th><th>Protocol</th><th>Supported</th><th>Last test</th><th>Action</th></tr></thead><tbody id="profiles"></tbody></table></section><section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Operation log</h2><button id="clear">Clear log</button></div><pre id="log" aria-live="polite"></pre></section><script>
+</style></head><body><h1>MikroTik Proxy Helper</h1><section class="cards"><div class="card"><div class="label">Mode</div><div class="value" id="mode">Loading…</div></div><div class="card"><div class="label">Health</div><div class="value" id="health">Loading…</div></div><div class="card"><div class="label">Latency</div><div class="value" id="latency">—</div></div></section><div class="toolbar"><button id="refresh">Refresh subscription</button><button id="test">Test active tunnel</button><button id="testAll">Test all tunnels</button><button id="cancelTest">Cancel current test</button></div><section class="panel"><div class="panel-head"><h2>Profiles</h2><span class="small" id="count"></span></div><table><thead><tr><th>Name</th><th>Endpoint</th><th>Protocol</th><th>Supported</th><th>Status</th><th>Latency (TTFB)</th><th>Action</th></tr></thead><tbody id="profiles"></tbody></table></section><section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Operation log</h2><button id="clear">Clear log</button></div><pre id="log" aria-live="polite"></pre></section><script>
 const logBox=document.getElementById('log');
 function line(message,kind='info'){const t=new Date().toLocaleTimeString();const mark=kind==='ok'?'OK':kind==='bad'?'ERROR':'INFO';logBox.textContent+='['+t+'] ['+mark+'] '+message+'\n';logBox.scrollTop=logBox.scrollHeight}
 function text(id,value){document.getElementById(id).textContent=value}
 function healthClass(status){return status==='healthy'?'ok':status==='unhealthy'?'bad':'warn'}
-async function request(path,options={}){const response=await fetch(path,options);let data;try{data=await response.json()}catch{throw new Error('HTTP '+response.status)}if(!response.ok||data.ok===false){throw new Error(data.message+(data.details&&data.details.error?': '+data.details.error:''))}return data}
+function failureDetails(details){if(!details)return '';const code=details.error_code||'';const message=details.error_message||details.error||'';if(code&&message)return code+': '+message;return message||code}
+async function request(path,options={}){const response=await fetch(path,options);let data;try{data=await response.json()}catch{throw new Error('HTTP '+response.status)}if(!response.ok||data.ok===false){const detail=failureDetails(data.details);throw new Error(data.message+(detail?': '+detail:''))}return data}
 async function loadStatus(){const data=await request('/api/status');const state=data.state;text('mode',state.mode);const h=document.getElementById('health');h.textContent=state.health.status;h.className='value '+healthClass(state.health.status);text('latency',state.health.latency_ms?state.health.latency_ms+' ms':'—');renderProfiles(data.profiles,state.selected_profile,data.last_tests||{});return data}
-function renderProfiles(profiles,selected,lastTests){const body=document.getElementById('profiles');body.replaceChildren();text('count',profiles.length+' profile(s)');for(const p of profiles){const tr=document.createElement('tr');if(p.id===selected)tr.className='selected';for(const value of [p.name,p.host+':'+p.port,p.scheme+'/'+(p.type||'raw')]){const td=document.createElement('td');td.textContent=value;tr.appendChild(td)}const supported=document.createElement('td');supported.textContent=p.supported?'Yes':'No — '+(p.reason||'unsupported');supported.className=p.supported?'ok':'bad';tr.appendChild(supported);const last=document.createElement('td');const result=lastTests[p.id];last.textContent=result?result.status:'—';last.className=result?(result.status==='healthy'?'ok':result.status==='unsupported'?'warn':'bad'):'';tr.appendChild(last);const action=document.createElement('td');const prepareButton=document.createElement('button');prepareButton.textContent=p.id===selected?'Prepared':'Prepare';prepareButton.disabled=!p.supported;prepareButton.onclick=()=>prepare(p,prepareButton);action.appendChild(prepareButton);const testButton=document.createElement('button');testButton.textContent='Test';testButton.style.marginLeft='6px';testButton.disabled=!p.supported;testButton.onclick=()=>testProfile(p,testButton);action.appendChild(testButton);tr.appendChild(action);body.appendChild(tr)}}
+function renderProfiles(profiles,selected,lastTests){const body=document.getElementById('profiles');body.replaceChildren();text('count',profiles.length+' profile(s)');const healthy=Object.values(lastTests).filter(r=>r.status==='healthy'&&r.ttfb_ms>0);const bestLatency=healthy.length?Math.min(...healthy.map(r=>r.ttfb_ms)):0;for(const p of profiles){const tr=document.createElement('tr');if(p.id===selected)tr.className='selected';for(const value of [p.name,p.host+':'+p.port,p.scheme+'/'+(p.type||'raw')]){const td=document.createElement('td');td.textContent=value;tr.appendChild(td)}const supported=document.createElement('td');supported.textContent=p.supported?'Yes':'No — '+(p.reason||'unsupported');supported.className=p.supported?'ok':'bad';tr.appendChild(supported);const result=lastTests[p.id];const last=document.createElement('td');last.textContent=result?result.status:'—';last.className=result?(result.status==='healthy'?'ok':result.status==='unsupported'?'warn':'bad'):'';tr.appendChild(last);const latency=document.createElement('td');if(result&&result.status==='healthy'&&result.ttfb_ms>0){const isBest=result.ttfb_ms===bestLatency;latency.textContent=result.ttfb_ms+' ms'+(isBest?' · Best':'');latency.className=isBest?'ok':''}else{latency.textContent='—'}tr.appendChild(latency);const action=document.createElement('td');const prepareButton=document.createElement('button');prepareButton.textContent=p.id===selected?'Prepared':'Prepare';prepareButton.disabled=!p.supported;prepareButton.onclick=()=>prepare(p,prepareButton);action.appendChild(prepareButton);const testButton=document.createElement('button');testButton.textContent='Test';testButton.style.marginLeft='6px';testButton.disabled=!p.supported;testButton.onclick=()=>testProfile(p,testButton);action.appendChild(testButton);tr.appendChild(action);body.appendChild(tr)}}
 async function busy(button,work){button.disabled=true;const old=button.textContent;button.textContent='Working…';try{await work()}finally{button.disabled=false;button.textContent=old}}
 async function prepare(profile,button){line('Preparing profile: '+profile.name);await busy(button,async()=>{try{const form=new URLSearchParams({id:profile.id});const r=await request('/api/select',{method:'POST',body:form});line(r.message+' — '+r.details.name+' — '+r.details.endpoint,'ok');await loadStatus()}catch(e){line(e.message,'bad')}})}
-async function testProfile(profile,button){line('Testing profile in an isolated Xray: '+profile.name);await busy(button,async()=>{try{const form=new URLSearchParams({id:profile.id});const r=await request('/api/tests/profile',{method:'POST',body:form});line(r.message+' — '+r.details.status+' — TTFB '+r.details.ttfb_ms+' ms','ok')}catch(e){line(e.message,'bad')}})}
+async function testProfile(profile,button){line('Testing profile in an isolated Xray: '+profile.name);await busy(button,async()=>{try{const form=new URLSearchParams({id:profile.id});const r=await request('/api/tests/profile',{method:'POST',body:form});line(r.message+' — '+r.details.status+' — TTFB '+r.details.ttfb_ms+' ms','ok')}catch(e){line(e.message,'bad')}finally{await loadStatus()}})}
 document.getElementById('refresh').onclick=e=>busy(e.currentTarget,async()=>{line('Downloading subscription…');try{const r=await request('/api/refresh',{method:'POST'});line(r.message+' — profiles found: '+r.details.profiles,'ok');await loadStatus()}catch(e){line(e.message,'bad')}});
 document.getElementById('test').onclick=e=>busy(e.currentTarget,async()=>{line('Testing active tunnel…');try{const r=await request('/api/health',{method:'POST'});line(r.message+' — latency: '+r.details.latency_ms+' ms','ok');await loadStatus()}catch(e){line(e.message,'bad');await loadStatus()}});
 document.getElementById('testAll').onclick=e=>busy(e.currentTarget,async()=>{line('Starting sequential Test All…');try{const r=await request('/api/tests/all',{method:'POST'});line(r.message+' — '+r.details.profiles+' profiles','ok')}catch(e){line(e.message,'bad')}});
 document.getElementById('cancelTest').onclick=e=>busy(e.currentTarget,async()=>{try{const r=await request('/api/tests/cancel',{method:'POST'});line(r.message+' — '+r.details.run_id)}catch(e){line(e.message,'bad')}});
 document.getElementById('clear').onclick=()=>{logBox.textContent=''};
-const eventStream=new EventSource('/api/events');eventStream.onmessage=async event=>{try{const message=JSON.parse(event.data);if(message.type==='profile-result'){const r=message.data.result;line('['+(message.data.index+1)+'/'+message.data.total+'] '+r.profile_name+' — '+r.status,r.status==='healthy'?'ok':r.status==='unsupported'?'info':'bad');await loadStatus()}else if(message.type==='run-completed'){line('Test All '+message.data.status+' — '+message.data.results.length+' results',message.data.status==='completed'?'ok':'bad')}}catch(e){line('Invalid live event','bad')}};eventStream.onerror=()=>line('Live event stream reconnecting…');
+const eventStream=new EventSource('/api/events');eventStream.onmessage=async event=>{try{const message=JSON.parse(event.data);if(message.type==='profile-result'){const r=message.data.result;const detail=r.status==='healthy'?' — TTFB '+r.ttfb_ms+' ms':(failureDetails(r)?' — '+failureDetails(r):'');line('['+(message.data.index+1)+'/'+message.data.total+'] '+r.profile_name+' — '+r.status+detail,r.status==='healthy'?'ok':r.status==='unsupported'?'info':'bad');await loadStatus()}else if(message.type==='run-completed'){line('Test All '+message.data.status+' — '+message.data.results.length+' results',message.data.status==='completed'?'ok':'bad')}}catch(e){line('Invalid live event','bad')}};eventStream.onerror=()=>line('Live event stream reconnecting…');
 loadStatus().then(()=>line('Helper interface ready','ok')).catch(e=>line(e.message,'bad'));
 </script></body></html>`
 
