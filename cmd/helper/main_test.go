@@ -62,6 +62,15 @@ func TestPageProvidesRouterModes(t *testing.T) {
 	}
 }
 
+func TestPageWaitsForRouterModeAndRefreshesInBackground(t *testing.T) {
+	for _, required := range []string{"waitForMode(mode)", "router.mode===mode", "setInterval", "refreshStatusSilently"} {
+		if !strings.Contains(page, required) { t.Fatalf("page is missing mode refresh behavior %q", required) }
+	}
+	if strings.Contains(page, "finally{setTimeout(loadStatus,2500)}") {
+		t.Fatal("page still uses the one-shot 2.5 second mode refresh")
+	}
+}
+
 func TestRestoreLastTestsUsesNewestResultPerProfile(t *testing.T) {
 	runs := []results.Run{
 		{Results: []model.TestResult{{ProfileID: "a", Status: "timeout"}, {ProfileID: "b", Status: "healthy", TTFBMS: 300}}},
