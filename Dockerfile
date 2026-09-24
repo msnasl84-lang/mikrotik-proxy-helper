@@ -8,7 +8,7 @@ COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} \
     go build -trimpath -ldflags="-s -w" -o /out/helper ./cmd/helper
 
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS xray-build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS xray-build
 ARG TARGETOS TARGETARCH TARGETVARIANT
 ARG XRAY_VERSION=v26.7.11
 RUN apk add --no-cache git ca-certificates
