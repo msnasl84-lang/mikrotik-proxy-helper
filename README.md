@@ -1,5 +1,11 @@
 # MikroTik Proxy Helper
 
+## Version 0.3.0-dev.5
+
+- Close SSE streams when the application context is cancelled.
+- Allow an intentional RouterOS container stop to finish without reaching the HTTP shutdown deadline.
+- Add a regression test for SSE shutdown behavior.
+
 `manual-health` subscription and tunnel helper for RouterOS containers.
 
 ## Safety invariants

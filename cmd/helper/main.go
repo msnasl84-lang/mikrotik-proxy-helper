@@ -32,7 +32,7 @@ import (
 	"github.com/OWNER/mikrotik-proxy-helper/internal/testengine"
 )
 
-const version = "0.3.0-dev.4"
+const version = "0.3.0-dev.5"
 
 type Profile = model.Profile
 
@@ -595,6 +595,7 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, ": connected\n\n"); flusher.Flush()
 	for {
 		select {
+		case <-a.ctx.Done(): return
 		case <-r.Context().Done(): return
 		case payload, open := <-stream:
 			if !open { return }

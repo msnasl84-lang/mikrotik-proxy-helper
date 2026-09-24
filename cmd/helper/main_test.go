@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/OWNER/mikrotik-proxy-helper/internal/events"
 	"github.com/OWNER/mikrotik-proxy-helper/internal/model"
 	"github.com/OWNER/mikrotik-proxy-helper/internal/results"
 )
@@ -49,4 +55,33 @@ func TestRestoreLastTestsUsesNewestResultPerProfile(t *testing.T) {
 	last := restoreLastTests(runs)
 	if last["a"].Status != "healthy" || last["a"].TTFBMS != 120 { t.Fatalf("unexpected profile a: %+v", last["a"]) }
 	if last["b"].TTFBMS != 300 { t.Fatalf("unexpected profile b: %+v", last["b"]) }
+}
+
+func TestEventStreamClosesWhenAppStops(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	app := &App{ctx: ctx, events: events.New()}
+	server := httptest.NewServer(http.HandlerFunc(app.handleEvents))
+	defer server.Close()
+
+	response, err := server.Client().Get(server.URL)
+	if err != nil { t.Fatal(err) }
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK { t.Fatalf("unexpected status: %d", response.StatusCode) }
+
+	initial := make([]byte, len(": connected\n\n"))
+	if _, err := io.ReadFull(response.Body, initial); err != nil { t.Fatalf("read initial event: %v", err) }
+
+	cancel()
+	closed := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 1)
+		_, err := response.Body.Read(buffer)
+		closed <- err
+	}()
+	select {
+	case err := <-closed:
+		if err == nil { t.Fatal("SSE stream remained readable after app shutdown") }
+	case <-time.After(time.Second):
+		t.Fatal("SSE stream did not close when app stopped")
+	}
 }
