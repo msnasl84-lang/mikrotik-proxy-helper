@@ -10,22 +10,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 type Profile struct {
 	ID           string `json:"id"`
@@ -88,6 +89,14 @@ type App struct {
 	client   *http.Client
 }
 
+type ActionResponse struct {
+	OK        bool      `json:"ok"`
+	Action    string    `json:"action"`
+	Message   string    `json:"message"`
+	Timestamp time.Time `json:"timestamp"`
+	Details   any       `json:"details,omitempty"`
+}
+
 func env(key, fallback string) string {
 	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
@@ -104,6 +113,13 @@ func envInt(key string, fallback int) int {
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("fatal: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	cfg := Config{
 		ListenAddr:      env("LISTEN_ADDR", ":8080"),
 		SubscriptionURL: env("SUBSCRIPTION_URL", ""),
@@ -118,19 +134,24 @@ func main() {
 		AuthPassword:    env("HELPER_PASSWORD", ""),
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
-		log.Fatal(err)
+		return err
 	}
+	lockFile, err := acquireInstanceLock(filepath.Join(cfg.DataDir, "helper.lock"))
+	if err != nil { return err }
+	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); _ = lockFile.Close() }()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	app := &App{cfg: cfg, state: State{Mode: "manual-health", Health: Health{Status: "unknown"}}}
 	app.client = app.proxyHTTPClient()
 	if err := app.loadState(); err != nil {
 		log.Printf("state load: %v", err)
 	}
 	if cfg.SubscriptionURL != "" {
-		if err := app.refreshSubscription(context.Background()); err != nil {
+		if err := app.refreshSubscription(ctx); err != nil {
 			log.Printf("initial subscription refresh: %v", err)
 		}
 	}
-	go app.healthLoop()
+	go app.healthLoop(ctx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", app.auth(app.handleIndex))
@@ -140,7 +161,33 @@ func main() {
 	mux.HandleFunc("/api/health", app.auth(app.handleHealth))
 	server := &http.Server{Addr: cfg.ListenAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	log.Printf("mikrotik-proxy-helper %s listening on %s", version, cfg.ListenAddr)
-	log.Fatal(server.ListenAndServe())
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- server.ListenAndServe() }()
+	select {
+	case err := <-serverErr:
+		if !errors.Is(err, http.ErrServerClosed) { return fmt.Errorf("HTTP server: %w", err) }
+		return nil
+	case <-ctx.Done():
+		log.Printf("shutdown requested")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil { return fmt.Errorf("HTTP shutdown: %w", err) }
+		log.Printf("shutdown complete")
+		return nil
+	}
+}
+
+func acquireInstanceLock(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil { return nil, fmt.Errorf("open instance lock: %w", err) }
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, errors.New("another helper instance is already running")
+	}
+	if err := f.Truncate(0); err == nil {
+		_, _ = f.WriteString(strconv.Itoa(os.Getpid()) + "\n")
+	}
+	return f, nil
 }
 
 func (a *App) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -275,9 +322,9 @@ func parseProfile(raw string) Profile {
 		p.Supported = p.Host != "" && p.Port > 0 && p.UUID != "" &&
 			(p.Type == "" || p.Type == "tcp" || p.Type == "raw") &&
 			(p.Security == "" || p.Security == "none")
-		if !p.Supported { p.Reason = "v0.1 supports VLESS raw/TCP with security=none only" }
+		if !p.Supported { p.Reason = "v0.2 supports VLESS raw/TCP with security=none only" }
 	} else {
-		p.Reason = "protocol detected but not enabled in v0.1"
+		p.Reason = "protocol detected but not enabled in v0.2"
 	}
 	identity := strings.Join([]string{p.Scheme, p.UUID, strings.ToLower(p.Host), strconv.Itoa(p.Port), q.Encode()}, "|")
 	sum := sha256.Sum256([]byte(identity))
@@ -287,8 +334,9 @@ func parseProfile(raw string) Profile {
 
 func (a *App) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost { http.Error(w, "POST required", http.StatusMethodNotAllowed); return }
-	if err := a.refreshSubscription(r.Context()); err != nil { http.Error(w, err.Error(), http.StatusBadGateway); return }
-	a.writeStatus(w)
+	if err := a.refreshSubscription(r.Context()); err != nil { a.writeAction(w, http.StatusBadGateway, false, "refresh", "Subscription refresh failed", map[string]any{"error":err.Error()}); return }
+	a.mu.RLock(); count := len(a.profiles); a.mu.RUnlock()
+	a.writeAction(w, http.StatusOK, true, "refresh", "Subscription refreshed successfully", map[string]any{"profiles":count})
 }
 
 func (a *App) handleSelect(w http.ResponseWriter, r *http.Request) {
@@ -300,19 +348,19 @@ func (a *App) handleSelect(w http.ResponseWriter, r *http.Request) {
 	for i := range a.profiles {
 		if a.profiles[i].ID == id { selected = &a.profiles[i]; break }
 	}
-	if selected == nil { http.Error(w, "profile not found", http.StatusNotFound); return }
-	if !selected.Supported { http.Error(w, selected.Reason, http.StatusUnprocessableEntity); return }
+	if selected == nil { a.writeAction(w,http.StatusNotFound,false,"prepare","Profile not found",nil); return }
+	if !selected.Supported { a.writeAction(w,http.StatusUnprocessableEntity,false,"prepare","Profile is not supported",map[string]any{"reason":selected.Reason}); return }
 	config := makeXrayConfig(*selected)
 	if err := writeJSONAtomic(filepath.Join(a.cfg.XrayConfigDir, "config.pending.json"), config, 0o600); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError); return
+		a.writeAction(w,http.StatusInternalServerError,false,"prepare","Could not write pending configuration",map[string]any{"error":err.Error()}); return
 	}
 	request := map[string]any{"action":"apply-profile","profile_id":selected.ID,"created_at":time.Now().UTC()}
 	if err := writeJSONAtomic(filepath.Join(a.cfg.DataDir, "apply-request.json"), request, 0o600); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError); return
+		a.writeAction(w,http.StatusInternalServerError,false,"prepare","Could not write apply request",map[string]any{"error":err.Error()}); return
 	}
 	a.state.SelectedProfile = selected.ID
 	_ = a.saveStateLocked()
-	a.writeStatusLocked(w)
+	a.writeAction(w,http.StatusOK,true,"prepare","Pending configuration created",map[string]any{"profile_id":selected.ID,"name":selected.Name,"endpoint":net.JoinHostPort(selected.Host,strconv.Itoa(selected.Port)),"protocol":selected.Scheme+"/"+selected.Type})
 }
 
 func makeXrayConfig(p Profile) map[string]any {
@@ -392,15 +440,30 @@ func (a *App) runHealth(ctx context.Context) Health {
 	a.state.Health=h; _=a.saveStateLocked(); return h
 }
 
-func (a *App) healthLoop() {
+func (a *App) healthLoop(ctx context.Context) {
 	ticker := time.NewTicker(a.cfg.HealthInterval); defer ticker.Stop()
-	for range ticker.C { ctx,cancel:=context.WithTimeout(context.Background(),a.cfg.HealthTimeout); a.runHealth(ctx); cancel() }
+	for {
+		select {
+		case <-ctx.Done(): return
+		case <-ticker.C:
+			checkCtx,cancel:=context.WithTimeout(ctx,a.cfg.HealthTimeout); a.runHealth(checkCtx); cancel()
+		}
+	}
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost { http.Error(w,"POST required",http.StatusMethodNotAllowed); return }
 	ctx,cancel:=context.WithTimeout(r.Context(),a.cfg.HealthTimeout); defer cancel(); h:=a.runHealth(ctx)
-	w.Header().Set("Content-Type","application/json"); json.NewEncoder(w).Encode(h)
+	ok := h.Status == "healthy"
+	status := http.StatusOK; message := "Active tunnel is healthy"
+	if !ok { status = http.StatusBadGateway; message = "Active tunnel health check failed" }
+	a.writeAction(w,status,ok,"health",message,h)
+}
+
+func (a *App) writeAction(w http.ResponseWriter, status int, ok bool, action, message string, details any) {
+	w.Header().Set("Content-Type","application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(ActionResponse{OK:ok,Action:action,Message:message,Timestamp:time.Now().UTC(),Details:details})
 }
 
 func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) { a.writeStatus(w) }
@@ -410,10 +473,26 @@ func (a *App) writeStatusLocked(w http.ResponseWriter) {
 	json.NewEncoder(w).Encode(map[string]any{"version":version,"state":a.state,"profiles":a.profiles})
 }
 
-var page = template.Must(template.New("index").Parse(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>MikroTik Proxy Helper</title><style>body{font-family:sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem;background:#111;color:#eee}table{width:100%;border-collapse:collapse}th,td{padding:.6rem;border-bottom:1px solid #444;text-align:left}button{padding:.5rem .8rem}code{color:#9fe}</style></head><body><h1>MikroTik Proxy Helper</h1><p>Mode: <code>{{.State.Mode}}</code> — Health: <code>{{.State.Health.Status}}</code></p><form method="post" action="/api/refresh"><button>Refresh subscription</button></form><h2>Profiles</h2><table><tr><th>Name</th><th>Endpoint</th><th>Protocol</th><th>Supported</th><th>Action</th></tr>{{range .Profiles}}<tr><td>{{.Name}}</td><td>{{.Host}}:{{.Port}}</td><td>{{.Scheme}}/{{.Type}}</td><td>{{.Supported}} {{.Reason}}</td><td><form method="post" action="/api/select"><input type="hidden" name="id" value="{{.ID}}"><button {{if not .Supported}}disabled{{end}}>Prepare</button></form></td></tr>{{end}}</table><form method="post" action="/api/health"><button>Test active tunnel</button></form></body></html>`))
+const page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MikroTik Proxy Helper</title><style>
+:root{color-scheme:dark;--bg:#0b1016;--panel:#121a23;--line:#293443;--text:#edf3f8;--muted:#98a8b8;--cyan:#67e8f9;--green:#4ade80;--yellow:#facc15;--red:#fb7185}*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:1120px;margin:0 auto;padding:28px 18px 50px;background:var(--bg);color:var(--text)}h1{margin:0 0 18px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}.label{font-size:.78rem;color:var(--muted);text-transform:uppercase}.value{margin-top:6px;font-weight:700;color:var(--cyan)}.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}button{border:1px solid #42536a;border-radius:8px;background:#1c2a3a;color:var(--text);padding:9px 14px;cursor:pointer;font-weight:650}button:hover{background:#26384d}button:disabled{opacity:.5;cursor:wait}table{width:100%;border-collapse:collapse}th,td{padding:11px 9px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted);font-size:.85rem}.selected{background:#102a25}.ok{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}#log{height:235px;overflow:auto;white-space:pre-wrap;margin:0;background:#080c11;border:1px solid var(--line);border-radius:8px;padding:12px;color:#cbd5e1;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.panel-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.panel-head h2{margin:0;font-size:1.15rem}.small{font-size:.84rem;color:var(--muted)}@media(max-width:720px){.cards{grid-template-columns:1fr}table{display:block;overflow-x:auto}}
+</style></head><body><h1>MikroTik Proxy Helper</h1><section class="cards"><div class="card"><div class="label">Mode</div><div class="value" id="mode">Loading…</div></div><div class="card"><div class="label">Health</div><div class="value" id="health">Loading…</div></div><div class="card"><div class="label">Latency</div><div class="value" id="latency">—</div></div></section><div class="toolbar"><button id="refresh">Refresh subscription</button><button id="test">Test active tunnel</button></div><section class="panel"><div class="panel-head"><h2>Profiles</h2><span class="small" id="count"></span></div><table><thead><tr><th>Name</th><th>Endpoint</th><th>Protocol</th><th>Supported</th><th>Action</th></tr></thead><tbody id="profiles"></tbody></table></section><section class="panel" style="margin-top:18px"><div class="panel-head"><h2>Operation log</h2><button id="clear">Clear log</button></div><pre id="log" aria-live="polite"></pre></section><script>
+const logBox=document.getElementById('log');
+function line(message,kind='info'){const t=new Date().toLocaleTimeString();const mark=kind==='ok'?'OK':kind==='bad'?'ERROR':'INFO';logBox.textContent+='['+t+'] ['+mark+'] '+message+'\n';logBox.scrollTop=logBox.scrollHeight}
+function text(id,value){document.getElementById(id).textContent=value}
+function healthClass(status){return status==='healthy'?'ok':status==='unhealthy'?'bad':'warn'}
+async function request(path,options={}){const response=await fetch(path,options);let data;try{data=await response.json()}catch{throw new Error('HTTP '+response.status)}if(!response.ok||data.ok===false){throw new Error(data.message+(data.details&&data.details.error?': '+data.details.error:''))}return data}
+async function loadStatus(){const data=await request('/api/status');const state=data.state;text('mode',state.mode);const h=document.getElementById('health');h.textContent=state.health.status;h.className='value '+healthClass(state.health.status);text('latency',state.health.latency_ms?state.health.latency_ms+' ms':'—');renderProfiles(data.profiles,state.selected_profile);return data}
+function renderProfiles(profiles,selected){const body=document.getElementById('profiles');body.replaceChildren();text('count',profiles.length+' profile(s)');for(const p of profiles){const tr=document.createElement('tr');if(p.id===selected)tr.className='selected';for(const value of [p.name,p.host+':'+p.port,p.scheme+'/'+(p.type||'raw')]){const td=document.createElement('td');td.textContent=value;tr.appendChild(td)}const supported=document.createElement('td');supported.textContent=p.supported?'Yes':'No — '+(p.reason||'unsupported');supported.className=p.supported?'ok':'bad';tr.appendChild(supported);const action=document.createElement('td');const button=document.createElement('button');button.textContent=p.id===selected?'Prepared':'Prepare';button.disabled=!p.supported;button.onclick=()=>prepare(p,button);action.appendChild(button);tr.appendChild(action);body.appendChild(tr)}}
+async function busy(button,work){button.disabled=true;const old=button.textContent;button.textContent='Working…';try{await work()}finally{button.disabled=false;button.textContent=old}}
+async function prepare(profile,button){line('Preparing profile: '+profile.name);await busy(button,async()=>{try{const form=new URLSearchParams({id:profile.id});const r=await request('/api/select',{method:'POST',body:form});line(r.message+' — '+r.details.name+' — '+r.details.endpoint,'ok');await loadStatus()}catch(e){line(e.message,'bad')}})}
+document.getElementById('refresh').onclick=e=>busy(e.currentTarget,async()=>{line('Downloading subscription…');try{const r=await request('/api/refresh',{method:'POST'});line(r.message+' — profiles found: '+r.details.profiles,'ok');await loadStatus()}catch(e){line(e.message,'bad')}});
+document.getElementById('test').onclick=e=>busy(e.currentTarget,async()=>{line('Testing active tunnel…');try{const r=await request('/api/health',{method:'POST'});line(r.message+' — latency: '+r.details.latency_ms+' ms','ok');await loadStatus()}catch(e){line(e.message,'bad');await loadStatus()}});
+document.getElementById('clear').onclick=()=>{logBox.textContent=''};
+loadStatus().then(()=>line('Helper interface ready','ok')).catch(e=>line(e.message,'bad'));
+</script></body></html>`
 
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" { http.NotFound(w,r); return }
-	a.mu.RLock(); defer a.mu.RUnlock()
-	if err := page.Execute(w,map[string]any{"State":a.state,"Profiles":a.profiles}); err != nil { log.Printf("template: %v",err) }
+	w.Header().Set("Content-Type","text/html; charset=utf-8")
+	_, _ = io.WriteString(w,page)
 }

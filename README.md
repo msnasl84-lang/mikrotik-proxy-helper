@@ -1,6 +1,6 @@
 # MikroTik Proxy Helper
 
-Initial `manual-health` helper for RouterOS containers.
+`manual-health` subscription and tunnel helper for RouterOS containers.
 
 ## Safety invariants
 
@@ -11,7 +11,7 @@ Initial `manual-health` helper for RouterOS containers.
 - RouterOS remains responsible for stopping Xray, validating/applying the pending config, starting Xray, and rolling back.
 - Secrets are runtime data and are not embedded in the image.
 
-## Version 0.1 scope
+## Version 0.2 scope
 
 - HTTP subscription download.
 - Base64 or plain-text subscription parsing.
@@ -21,6 +21,11 @@ Initial `manual-health` helper for RouterOS containers.
 - End-to-end HTTP health check through the active Xray SOCKS5 listener.
 - Persistent state in `/data`.
 - Pending apply request for the RouterOS coordinator.
+- In-page action results without navigation or reload.
+- Responsive status cards, profile table, and operation log.
+- Graceful `SIGTERM`/`SIGINT` shutdown with an eight-second deadline.
+- A process lock in `/data/helper.lock` to prevent concurrent helper instances.
+- Health worker cancellation during shutdown.
 
 Other protocols are detected but intentionally marked unsupported until their core adapters are implemented.
 
