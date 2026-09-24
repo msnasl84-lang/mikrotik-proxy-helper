@@ -12,6 +12,7 @@ FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS xray-build
 ARG TARGETOS TARGETARCH TARGETVARIANT
 ARG XRAY_VERSION=v26.7.11
 ENV GOBIN=/out
+RUN apk add --no-cache git ca-certificates
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} \
     go install -trimpath -ldflags="-s -w" github.com/xtls/xray-core/main@${XRAY_VERSION}
 
