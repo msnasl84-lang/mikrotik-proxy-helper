@@ -63,7 +63,7 @@ func TestPageProvidesRouterModes(t *testing.T) {
 }
 
 func TestPageWaitsForRouterModeAndRefreshesInBackground(t *testing.T) {
-	for _, required := range []string{"waitForMode(mode)", "router.mode===mode", "setInterval", "refreshStatusSilently"} {
+	for _, required := range []string{"waitForMode(mode)", "(data.router||{}).mode===mode", "setInterval", "refreshStatusSilently"} {
 		if !strings.Contains(page, required) { t.Fatalf("page is missing mode refresh behavior %q", required) }
 	}
 	if strings.Contains(page, "finally{setTimeout(loadStatus,2500)}") {
