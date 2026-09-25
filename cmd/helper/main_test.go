@@ -66,8 +66,17 @@ func TestPageWaitsForRouterModeAndRefreshesInBackground(t *testing.T) {
 	for _, required := range []string{"waitForMode(mode)", "(data.router||{}).mode===mode", "setInterval", "refreshStatusSilently"} {
 		if !strings.Contains(page, required) { t.Fatalf("page is missing mode refresh behavior %q", required) }
 	}
-	if strings.Contains(page, "finally{setTimeout(loadStatus,2500)}") {
-		t.Fatal("page still uses the one-shot 2.5 second mode refresh")
+	start := strings.Index(page, "for(const button of document.querySelectorAll('[data-mode]'))")
+	if start < 0 {
+		t.Fatal("mode button handler is missing")
+	}
+	endOffset := strings.Index(page[start:], "const eventStream=")
+	if endOffset < 0 {
+		t.Fatal("mode button handler boundary is missing")
+	}
+	modeHandler := page[start : start+endOffset]
+	if strings.Contains(modeHandler, "setTimeout(loadStatus,2500)") {
+		t.Fatal("mode handler still uses the one-shot 2.5 second refresh")
 	}
 }
 
