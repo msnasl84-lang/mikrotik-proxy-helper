@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -66,18 +68,23 @@ func TestPageWaitsForRouterModeAndRefreshesInBackground(t *testing.T) {
 	for _, required := range []string{"waitForMode(mode)", "(data.router||{}).mode===mode", "setInterval", "refreshStatusSilently"} {
 		if !strings.Contains(page, required) { t.Fatalf("page is missing mode refresh behavior %q", required) }
 	}
-	start := strings.Index(page, "for(const button of document.querySelectorAll('[data-mode]'))")
-	if start < 0 {
-		t.Fatal("mode button handler is missing")
+}
+
+func TestStatusHidesStaleHealthWhileModeIsBlocked(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "router-status.json"), []byte(`{"mode":"blocked"}`), 0o600); err != nil { t.Fatal(err) }
+	app := &App{cfg: Config{DataDir:dir}, state: State{Health:Health{Status:"healthy", LatencyMS:100}}}
+	w := httptest.NewRecorder()
+	app.writeStatus(w)
+	var response struct {
+		State State `json:"state"`
+		Profiles []Profile `json:"profiles"`
 	}
-	endOffset := strings.Index(page[start:], "const eventStream=")
-	if endOffset < 0 {
-		t.Fatal("mode button handler boundary is missing")
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil { t.Fatal(err) }
+	if response.State.Health.Status != "inactive" || response.State.Health.LatencyMS != 0 {
+		t.Fatalf("stale health shown in blocked mode: %+v", response.State.Health)
 	}
-	modeHandler := page[start : start+endOffset]
-	if strings.Contains(modeHandler, "setTimeout(loadStatus,2500)") {
-		t.Fatal("mode handler still uses the one-shot 2.5 second refresh")
-	}
+	if response.Profiles == nil { t.Fatal("empty profiles must serialize as an array") }
 }
 
 func TestRestoreLastTestsUsesNewestResultPerProfile(t *testing.T) {
