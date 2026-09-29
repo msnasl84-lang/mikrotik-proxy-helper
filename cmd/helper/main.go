@@ -476,7 +476,7 @@ func makeXrayConfig(p Profile) map[string]any {
 	stream := map[string]any{"method":"raw", "security":p.Security, "rawSettings":rawSettings}
 	if stream["security"] == "" { stream["security"] = "none" }
 	return map[string]any{
-		"log": map[string]any{"loglevel":"warning"},
+		"log": map[string]any{"access":"none","loglevel":"warning"},
 		"inbounds": []any{map[string]any{"tag":"socks-in","listen":"0.0.0.0","port":1080,"protocol":"socks","settings":map[string]any{"auth":"noauth","udp":true}}},
 		"outbounds": []any{map[string]any{"tag":"selected-proxy","protocol":"vless","settings":map[string]any{"vnext":[]any{map[string]any{"address":p.Host,"port":p.Port,"users":[]any{map[string]any{"id":p.UUID,"encryption":"none"}}}}},"streamSettings":stream}},
 		"routing": map[string]any{"domainStrategy":"AsIs","rules":[]any{map[string]any{"type":"field","inboundTag":[]string{"socks-in"},"outboundTag":"selected-proxy"}}},
