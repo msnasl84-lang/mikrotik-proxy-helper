@@ -21,16 +21,21 @@ type Profile struct {
 }
 
 type TestResult struct {
-	RunID        string    `json:"run_id"`
-	ProfileID    string    `json:"profile_id"`
-	ProfileName  string    `json:"profile_name"`
-	Status       string    `json:"status"`
-	Stage        string    `json:"stage"`
-	EndpointMS   int64     `json:"endpoint_ms,omitempty"`
-	TTFBMS       int64     `json:"ttfb_ms,omitempty"`
-	TotalMS      int64     `json:"total_ms,omitempty"`
-	HTTPStatus   int       `json:"http_status,omitempty"`
-	ErrorCode    string    `json:"error_code,omitempty"`
-	ErrorMessage string    `json:"error_message,omitempty"`
-	TestedAt     time.Time `json:"tested_at"`
+	ServerIPs     []string  `json:"server_ips,omitempty"`
+	ServerIPError string    `json:"server_ip_error,omitempty"`
+	ExitIP        string    `json:"exit_ip,omitempty"`
+	ExitCountry   string    `json:"exit_country,omitempty"`
+	IdentityError string    `json:"identity_error,omitempty"`
+	RunID         string    `json:"run_id"`
+	ProfileID     string    `json:"profile_id"`
+	ProfileName   string    `json:"profile_name"`
+	Status        string    `json:"status"`
+	Stage         string    `json:"stage"`
+	EndpointMS    int64     `json:"endpoint_ms,omitempty"`
+	TTFBMS        int64     `json:"ttfb_ms,omitempty"`
+	TotalMS       int64     `json:"total_ms,omitempty"`
+	HTTPStatus    int       `json:"http_status,omitempty"`
+	ErrorCode     string    `json:"error_code,omitempty"`
+	ErrorMessage  string    `json:"error_message,omitempty"`
+	TestedAt      time.Time `json:"tested_at"`
 }

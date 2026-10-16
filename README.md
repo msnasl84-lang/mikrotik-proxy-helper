@@ -1,6 +1,6 @@
 # MikroTik Proxy Helper
 
-## Version 0.3.0-dev.9
+## Version 0.3.0-dev.11
 
 This release separates profile preparation from activation and adds file-based
 RouterOS mode requests for `vless`, `blocked`, and `direct`. RouterOS remains
@@ -12,6 +12,22 @@ is outside this project's scope and remains under independent RouterOS control.
 - Add a regression test for SSE shutdown behavior.
 - Wait for RouterOS to confirm a requested mode instead of doing a single early refresh.
 - Refresh visible router status in the background every five seconds.
+
+### Profile IP details
+
+The profile table now shows resolved server IP addresses, the observed exit IP,
+and the exit country (localized in Persian) alongside the existing test time.
+Use **Test** or **Test all tunnels** to populate these values. Previously saved
+results without IP fields remain readable and display a dash until retested.
+
+Server IPs are a DNS snapshot from the Helper at test time, not proof of which
+address Xray connected to. Exit IP/country are parsed from Cloudflare's HTTPS
+trace response through that profile's isolated SOCKS listener. With the default
+`TEST_URL`, the existing health response is reused; a custom `TEST_URL` adds a
+trace request through the same listener within the total test deadline. There
+is no direct-network fallback. Identity lookup errors leave a successful health
+test healthy, display an explanation on hover, and do not reuse another test's
+IP. Country is an IP geolocation estimate, not a physical-server guarantee.
 
 `manual-health` subscription and tunnel helper for RouterOS containers.
 
