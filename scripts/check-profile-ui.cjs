@@ -17,6 +17,8 @@ const profile = {id:'a', name:'<script>not HTML</script>', host:'server.example'
 sandbox.renderProfiles([profile], '', '', {a:{status:'healthy', server_ips:['192.0.2.1','2001:db8::1'], exit_ip:'203.0.113.2', exit_country:'DE', ttfb_ms:123}});
 let cells = body.children[0].children;
 assert.equal(cells.length, 10);
+const headers = Array.from(source.match(/<thead>([\s\S]*?)<\/thead>/)[1].matchAll(/<th(?: [^>]*)?>(.*?)<\/th>/g), m=>m[1]);
+assert.deepEqual(headers, ['Name', 'Endpoint', 'Protocol', 'IP سرور', 'IP خروجی', 'کشور خروجی', 'Supported', 'Last isolated test', 'Latency (TTFB)', 'Action']);
 assert.equal(cells[0].textContent, profile.name);
 assert.equal(cells[2].textContent, 'vless/raw');
 assert.equal(cells[3].textContent, '192.0.2.1, 2001:db8::1');
